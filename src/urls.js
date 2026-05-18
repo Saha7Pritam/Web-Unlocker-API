@@ -79,10 +79,7 @@ const STORES = [
         slug: "cpu-processor",
         url: "https://vishalperipherals.com/collections/processors",
       },
-      {
-        slug: "ram-memory",
-        url: "https://vishalperipherals.com/collections/ram",
-      },
+    //  { slug: "ram-memory", url: "https://vishalperipherals.com/collections/ram" },
     ],
   },
 
