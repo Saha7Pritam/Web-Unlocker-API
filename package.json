@@ -4,25 +4,26 @@
   "description": "Multi-store price scraper using Bright Data Web Unlocker API",
   "main": "src/scraper.js",
   "scripts": {
-    "scrape"        : "node src/scraper.js",
-    "upload"        : "node src/upload_to_cosmos.js",
-    "map"           : "node src/cleanup_mapper.js",
-    "sync-internal" : "node src/internal_db_sync.js",
-    "recommend"     : "node src/recommendation_engine.js",
-    "api"           : "node src/api_server.js"
+    "scrape": "node src/scraper/index.js",
+    "schedule": "node src/scheduler/index.js",
+    "upload": "node src/upload_to_cosmos.js",
+    "map": "node src/cleanup_mapper.js",
+    "sync-internal": "node src/internal_db_sync.js",
+    "recommend": "node src/recommendation_engine.js",
+    "api": "node src/api_server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@azure/cosmos"  : "^4.9.3",
+    "@azure/cosmos": "^4.9.3",
     "@azure/identity": "^4.13.1",
-    "cheerio"        : "^1.0.0",
-    "cors"           : "^2.8.6",
-    "dotenv"         : "^17.4.2",
-    "express"        : "^5.2.1",
-    "mssql"          : "^12.5.1",
-    "uuid"           : "^14.0.0"
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "mssql": "^12.5.1",
+    "uuid": "^14.0.0"
   }
 }
