@@ -33,10 +33,7 @@ const STORES = [
     name: "mdcomputers",
     parser: require("./parsers/mdcomputers"),
     categories: [
-      {
-        slug: "cpu-processor",
-        url: "https://mdcomputers.in/catalog/processor",
-      },
+      { slug: "cpu-processor", url: "https://mdcomputers.in/catalog/processor"},
       // { slug: 'motherboards',  url: 'https://mdcomputers.in/catalog/motherboard' },
       { slug: "ram-memory", url: "https://mdcomputers.in/catalog/ram" },
     ],
@@ -75,10 +72,7 @@ const STORES = [
     name: "vishal",
     parser: require("./parsers/vishal"),
     categories: [
-      {
-        slug: "cpu-processor",
-        url: "https://vishalperipherals.com/collections/processors",
-      },
+      { slug: "cpu-processor", url: "https://vishalperipherals.com/collections/processors" },
       { slug: "ram-memory", url: "https://vishalperipherals.com/collections/ram" },
     ],
   },
