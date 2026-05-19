@@ -172,29 +172,36 @@ const originalPrice =
     }
   }
 
+  
   /*
   |--------------------------------------------------------------------------
   | MODEL NUMBER
   |--------------------------------------------------------------------------
   */
 
-  const modelPatterns = [
-    /BX[0-9A-Z]+/i,
-    /100-[0-9A-Z]+/i,
-    /YD[0-9A-Z]+/i,
-    /CM[0-9A-Z]+/i,
-  ];
 
-  let modelNumber = null;
+let modelNumber = null;
 
-  for (const pattern of modelPatterns) {
-    const match = bodyText.match(pattern);
+// Vishal structure:
+// <label class="label">Model Number:</label>
+// <span>CT8G48C40S5</span>
 
-    if (match) {
-      modelNumber = match[0];
-      break;
+$('label').each((_, el) => {
+  const labelText = cleanText($(el).text());
+
+  if (
+    labelText &&
+    labelText.toLowerCase().includes('model number')
+  ) {
+    const value = cleanText(
+      $(el).next('span').text()
+    );
+
+    if (value) {
+      modelNumber = value;
     }
   }
+});
 
   /*
   |--------------------------------------------------------------------------

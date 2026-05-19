@@ -170,36 +170,53 @@ const originalPrice =
     cleanText($('.sku').first().text()) ||
     null;
 
-  /*
-  |--------------------------------------------------------------------------
-  | MODEL NUMBER
-  |--------------------------------------------------------------------------
-  */
+ /*
+|--------------------------------------------------------------------------
+| MODEL NUMBER
+|--------------------------------------------------------------------------
+*/
 
-  let modelNumber = null;
+let modelNumber = null;
 
-  const bodyText = $('body').text();
+/*
+|--------------------------------------------------------------------------
+| 1. Extract from explicit "Model No"
+|--------------------------------------------------------------------------
+*/
 
-  /*
-  |--------------------------------------------------------------------------
-  | Try BX / Ryzen / Intel style model extraction
-  |--------------------------------------------------------------------------
-  */
+$('span, p, div').each((_, el) => {
+  const text = cleanText($(el).text());
 
-  const modelPatterns = [
-    /BX[0-9A-Z]+/i,
-    /100-[0-9A-Z]+/i,
-    /[A-Z0-9]{6,}-?[A-Z0-9]*/i
-  ];
-
-  for (const pattern of modelPatterns) {
-    const match = bodyText.match(pattern);
+  if (
+    text &&
+    /model\s*no/i.test(text)
+  ) {
+    const match = text.match(
+      /model\s*no\s*:?\s*([A-Z0-9-]+)/i
+    );
 
     if (match) {
-      modelNumber = match[0];
-      break;
+      modelNumber = match[1];
+      return false;
     }
   }
+});
+
+/*
+|--------------------------------------------------------------------------
+| 2. Fallback from product name
+|--------------------------------------------------------------------------
+*/
+
+if (!modelNumber && name) {
+  const match = name.match(
+    /\(([A-Z0-9-]+)\)/
+  );
+
+  if (match) {
+    modelNumber = match[1];
+  }
+}
 
   /*
   |--------------------------------------------------------------------------
