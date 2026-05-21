@@ -260,8 +260,17 @@ async function fetchCombinedData() {
   return { zohoRows, shopifyRows, combined };
 }
 
-module.exports = { fetchPurchasePrices, fetchShopifySKUs, fetchCombinedData };
+// Add this to azureSqlService.js as an exported function
+function clearTokenTimers() {
+  for (const key of Object.keys(tokenCache)) {
+    if (tokenCache[key].refreshTimer) {
+      clearTimeout(tokenCache[key].refreshTimer);
+      tokenCache[key].refreshTimer = null;
+    }
+  }
+}
 
+module.exports = { fetchPurchasePrices, fetchShopifySKUs, fetchCombinedData, clearTokenTimers };
 
 
 
