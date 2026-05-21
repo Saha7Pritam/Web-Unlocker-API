@@ -11,11 +11,77 @@ const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
 const { STORES }           = require('./urls');
 
+const session    = require('express-session');
+const { msalClient } = require('./auth/msalConfig');
+const { requireAuth } = require('./auth/authMiddleware');
+
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+
+// ── Session middleware (add near top, after cors/json) ────────
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false }, // true in production (HTTPS)
+}));
+
+// ── GET /auth/login ───────────────────────────────────────────
+// Generates Microsoft login URL and redirects browser to it
+app.get('/auth/login', async (req, res) => {
+  const authCodeUrlParams = {
+    scopes      : ['user.read'],
+    redirectUri : process.env.REDIRECT_URI,
+  };
+  const authUrl = await msalClient.getAuthCodeUrl(authCodeUrlParams);
+  res.redirect(authUrl);
+});
+
+// ── GET /auth/callback ────────────────────────────────────────
+// Microsoft redirects here after login with a code
+app.get('/auth/callback', async (req, res) => {
+  const tokenRequest = {
+    code        : req.query.code,
+    scopes      : ['user.read'],
+    redirectUri : process.env.REDIRECT_URI,
+  };
+
+  try {
+    const response = await msalClient.acquireTokenByCode(tokenRequest);
+
+    // Store user info in session
+    req.session.user = {
+      name  : response.account.name,
+      email : response.account.username,  // this is their @tpstech.in email
+      role  : 'sales', // hardcode for now — replace with Azure AD group check later
+    };
+
+    res.redirect(process.env.FRONTEND_URL || 'http://localhost:5173');
+
+  } catch (err) {
+    console.error('Auth callback error:', err.message);
+    res.status(500).send('Login failed');
+  }
+});
+
+// ── GET /auth/me ──────────────────────────────────────────────
+// Frontend calls this on load to check if user is logged in
+app.get('/auth/me', (req, res) => {
+  if (!req.session?.user) {
+    return res.status(401).json({ authenticated: false });
+  }
+  res.json({ authenticated: true, user: req.session.user });
+});
+
+// ── POST /auth/logout ─────────────────────────────────────────
+app.post('/auth/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ success: true });
+});
 
 // ── SQL connection ────────────────────────────────────────────
 async function getSqlPool() {
