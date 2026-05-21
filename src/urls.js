@@ -18,10 +18,17 @@ const STORES = [
       { slug: "cpu-processor", url: "https://www.primeabgb.com/buy-online-price-india/cpu-processor/"},
       { slug: "ram-memory", url: "https://www.primeabgb.com/buy-online-price-india/ram-memory/"},
     //  { slug: 'motherboards',  url: 'https://www.primeabgb.com/buy-online-price-india/motherboards/' },
-     // { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
+    //  { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
     //  { slug: 'monitors', url: 'https://www.primeabgb.com/buy-online-price-india/led-monitors/'},
       { slug: 'hdd', url: 'https://www.primeabgb.com/buy-online-price-india/internal-hard-drive/' },
     // { slug: 'ssd', url: 'https://www.primeabgb.com/buy-online-price-india/ssd/' },
+        { slug: 'smps', url: 'https://www.primeabgb.com/buy-online-price-india/power-supplies-smps/'},
+        { slug: 'gaming-routers', url: 'https://www.primeabgb.com/buy-online-price-india/gaming-wireless-routers/'},
+        { slug: 'gaming-headset', url: 'https://www.primeabgb.com/buy-online-price-india/gaming-headset/'},
+
+        { slug: 'cpu-cooler', url: 'https://www.primeabgb.com/buy-online-price-india/cpu-cooler/'},
+        { slug: 'pc-case-cabinets', url: 'https://www.primeabgb.com/buy-online-price-india/pc-cases-cabinet/'},
+        { slug: 'nas', url: 'https://www.primeabgb.com/buy-online-price-india/network-attached-storage-nas/'},
       
     ],
   },
@@ -43,6 +50,8 @@ const STORES = [
       { slug: 'external-ssd',    url: 'https://mdcomputers.in/catalog/storage/ssd-drive/external-ssd'},
       { slug: 'pen-drives',      url: 'https://mdcomputers.in/catalog/storage/pen-drive'},
     //  { slug: 'motherboards',    url: 'https://mdcomputers.in/catalog/motherboard' },
+
+    {slug: 'cabinet', url: 'https://mdcomputers.in/catalog/cabinet'},
     ],
   },
 
