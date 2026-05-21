@@ -5,7 +5,7 @@
 require('dotenv/config');
 const sql = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
-const { fetchCombinedData } = require('./services/azureSqlService.js');
+const { fetchCombinedData, clearTokenTimers  } = require('./services/azureSqlService.js');
 
 // ── SQL connection to db_tpstechautomata ──────────────────────
 async function getTargetPool() {
@@ -165,6 +165,9 @@ async function syncInternalProducts() {
     console.log(`   Rows touched : ${result.rowsAffected[0]}`);
     console.log(`   Merge time   : ${mergeSec}s`);
     console.log(`   Total time   : ${totalSec}s`);
+
+
+    clearTokenTimers(); // Clear Azure AD token refresh timers to prevent leaks in long-running processes
 
     await pool.close();
 
