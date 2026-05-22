@@ -44,9 +44,9 @@ app.get('/auth/login', async (req, res) => {
   res.redirect(authUrl);
 });
 
-// ── GET /auth/callback ────────────────────────────────────────
+// ── GET /callback ────────────────────────────────────────
 // Microsoft redirects here after login with a code
-app.get('/auth/callback', async (req, res) => {
+app.get('/callback', async (req, res) => {
   const tokenRequest = {
     code        : req.query.code,
     scopes      : ['user.read'],
