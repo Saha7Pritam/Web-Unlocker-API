@@ -360,6 +360,55 @@ app.post('/api/refresh-product', async (req, res) => {
   }
 });
 
+
+
+// ── ADD this block to src/api_server.js ──────────────────────
+// Place it anywhere after getSqlPool() is defined,
+// alongside the other app.get / app.post routes.
+//
+// GET /api/competitor-details/:skuId
+// ─────────────────────────────────────────────────────────────
+// Returns up to 4 in-stock competitors for a single SKU,
+// ranked by CompetitorPrice ASC.
+// Called lazily by CompetitorCell on first hover/expand.
+// The /api/recommendations endpoint is NOT changed.
+
+app.get('/api/competitor-details/:skuId', async (req, res) => {
+  const { skuId } = req.params;
+
+  if (!skuId) {
+    return res.status(400).json({ success: false, error: 'skuId is required' });
+  }
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const result = await pool.request()
+      .input('SKU', sql.NVarChar(100), skuId)
+      .query(`
+        SELECT TOP 4
+          CompetitorPrice,
+          ProductURL,
+          StoreName,
+          StockStatus
+        FROM CompetitorPrices
+        WHERE SKU             = @SKU
+          AND CompetitorPrice IS NOT NULL
+          AND LOWER(StockStatus) != 'out of stock'
+        ORDER BY CompetitorPrice ASC
+      `);
+
+    res.json({ success: true, data: result.recordset });
+
+  } catch (err) {
+    console.error(`❌ /api/competitor-details/${skuId}:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
 // ── Health check ──────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
