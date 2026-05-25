@@ -409,6 +409,134 @@ app.get('/api/competitor-details/:skuId', async (req, res) => {
   }
 });
 
+
+
+
+// Both routes use requireAuth middleware — already imported in api_server.js.
+
+// ── GET /api/pp-products ──────────────────────────────────────
+// Returns all internal products for the PP Update table in the UI.
+// Includes PP, LastBillDate, ManualPP_UpdatedAt, ManualPP_UpdatedBy
+// so the UI can show audit info next to each row.
+app.get('/api/pp-products', requireAuth, async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const result = await pool.request().query(`
+      SELECT
+        SKU_ID,
+        Title,
+        Category,
+        Brand,
+        PP,
+        LastBillDate,
+        ManualPP_UpdatedAt,
+        ManualPP_UpdatedBy,
+        -- Effective PP source for display
+        CASE
+          WHEN ManualPP_UpdatedAt IS NOT NULL
+           AND LastBillDate IS NOT NULL
+           AND ManualPP_UpdatedAt >= CAST(LastBillDate AS DATETIME2)
+            THEN 'manual'
+          WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NULL
+            THEN 'manual'
+          ELSE 'bill'
+        END AS PPSource
+      FROM InternalProducts
+      WHERE isActive = 1
+      ORDER BY Category, Title
+    `);
+
+    console.log(`✅ /api/pp-products — ${result.recordset.length} rows`);
+    res.json({ success: true, data: result.recordset });
+
+  } catch (err) {
+    console.error('❌ /api/pp-products error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── PATCH /api/update-pp ──────────────────────────────────────
+// Manually override PP for a single SKU.
+//
+// Body: { skuId: string, newPP: number }
+//
+// Writes:
+//   PP               = newPP           (overwrites bill PP)
+//   ManualPP_UpdatedAt = GETDATE()     (audit: when)
+//   ManualPP_UpdatedBy = user email    (audit: who)
+//
+// Does NOT touch LastBillDate — that is owned by internal_db_sync.
+// Does NOT touch RecommendedSP — that is recalculated by recommendation_engine.
+//   (Run the engine after a batch of PP updates to refresh RecommendedSP values.)
+
+app.patch('/api/update-pp', requireAuth, async (req, res) => {
+  const { skuId, newPP } = req.body;
+
+  if (!skuId || newPP == null) {
+    return res.status(400).json({ success: false, error: 'skuId and newPP are required' });
+  }
+
+  const parsedPP = parseFloat(newPP);
+  if (isNaN(parsedPP) || parsedPP <= 0) {
+    return res.status(400).json({ success: false, error: 'newPP must be a positive number' });
+  }
+
+  // Get the logged-in user's email from session (set during Microsoft auth callback)
+  const updatedBy = req.session?.user?.email || 'unknown';
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const result = await pool.request()
+      .input('SKU_ID',            sql.NVarChar(100),  skuId)
+      .input('PP',                sql.Decimal(10, 2), parsedPP)
+      .input('ManualPP_UpdatedBy',sql.NVarChar(150),  updatedBy)
+      .query(`
+        UPDATE InternalProducts
+        SET
+          PP                 = @PP,
+          ManualPP_UpdatedAt = GETDATE(),
+          ManualPP_UpdatedBy = @ManualPP_UpdatedBy
+        WHERE SKU_ID = @SKU_ID;
+
+        -- Return the updated row so the UI can refresh immediately
+        SELECT
+          SKU_ID,
+          PP,
+          ManualPP_UpdatedAt,
+          ManualPP_UpdatedBy,
+          LastBillDate
+        FROM InternalProducts
+        WHERE SKU_ID = @SKU_ID;
+      `);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
+
+    const updated = result.recordset[0];
+    console.log(`✅ PP updated: SKU=${skuId} | PP=₹${parsedPP} | By=${updatedBy}`);
+
+    res.json({ success: true, data: updated });
+
+  } catch (err) {
+    console.error(`❌ /api/update-pp error for ${skuId}:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+
+
 // ── Health check ──────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
