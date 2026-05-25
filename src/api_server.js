@@ -11,11 +11,80 @@ const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
 const { STORES }           = require('./urls');
 
-const app  = express();
-const PORT = process.env.PORT || 3001;
+const session    = require('express-session');
+const { msalClient } = require('./auth/msalConfig');
+const { requireAuth } = require('./auth/authMiddleware');
 
-app.use(cors());
+const app  = express();
+const PORT = process.env.PORT || 8000;
+
+app.use(cors({
+  origin     : process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true,
+}));
 app.use(express.json());
+
+
+// ── Session middleware (add near top, after cors/json) ────────
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false }, // true in production (HTTPS)
+}));
+
+// ── GET /auth/login ───────────────────────────────────────────
+// Generates Microsoft login URL and redirects browser to it
+app.get('/auth/login', async (req, res) => {
+  const authCodeUrlParams = {
+    scopes      : ['user.read'],
+    redirectUri : process.env.REDIRECT_URI,
+  };
+  const authUrl = await msalClient.getAuthCodeUrl(authCodeUrlParams);
+  res.redirect(authUrl);
+});
+
+// ── GET /callback ────────────────────────────────────────
+// Microsoft redirects here after login with a code
+app.get('/callback', async (req, res) => {
+  const tokenRequest = {
+    code        : req.query.code,
+    scopes      : ['user.read'],
+    redirectUri : process.env.REDIRECT_URI,
+  };
+
+  try {
+    const response = await msalClient.acquireTokenByCode(tokenRequest);
+
+    // Store user info in session
+    req.session.user = {
+      name  : response.account.name,
+      email : response.account.username,  // this is their @tpstech.in email
+      role  : 'sales', // hardcode for now — replace with Azure AD group check later
+    };
+
+    res.redirect(process.env.FRONTEND_URL || 'http://localhost:5173');
+
+  } catch (err) {
+    console.error('Auth callback error:', err.message);
+    res.status(500).send('Login failed');
+  }
+});
+
+// ── GET /auth/me ──────────────────────────────────────────────
+// Frontend calls this on load to check if user is logged in
+app.get('/auth/me', (req, res) => {
+  if (!req.session?.user) {
+    return res.status(401).json({ authenticated: false });
+  }
+  res.json({ authenticated: true, user: req.session.user });
+});
+
+// ── POST /auth/logout ─────────────────────────────────────────
+app.post('/auth/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ success: true });
+});
 
 // ── SQL connection ────────────────────────────────────────────
 async function getSqlPool() {
@@ -285,6 +354,55 @@ app.post('/api/refresh-product', async (req, res) => {
 
   } catch (err) {
     console.error(`❌ Manual refresh failed: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+// ── ADD this block to src/api_server.js ──────────────────────
+// Place it anywhere after getSqlPool() is defined,
+// alongside the other app.get / app.post routes.
+//
+// GET /api/competitor-details/:skuId
+// ─────────────────────────────────────────────────────────────
+// Returns up to 4 in-stock competitors for a single SKU,
+// ranked by CompetitorPrice ASC.
+// Called lazily by CompetitorCell on first hover/expand.
+// The /api/recommendations endpoint is NOT changed.
+
+app.get('/api/competitor-details/:skuId', async (req, res) => {
+  const { skuId } = req.params;
+
+  if (!skuId) {
+    return res.status(400).json({ success: false, error: 'skuId is required' });
+  }
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const result = await pool.request()
+      .input('SKU', sql.NVarChar(100), skuId)
+      .query(`
+        SELECT TOP 4
+          CompetitorPrice,
+          ProductURL,
+          StoreName,
+          StockStatus
+        FROM CompetitorPrices
+        WHERE SKU             = @SKU
+          AND CompetitorPrice IS NOT NULL
+          AND LOWER(StockStatus) != 'out of stock'
+        ORDER BY CompetitorPrice ASC
+      `);
+
+    res.json({ success: true, data: result.recordset });
+
+  } catch (err) {
+    console.error(`❌ /api/competitor-details/${skuId}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     if (pool) await pool.close();

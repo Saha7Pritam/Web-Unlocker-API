@@ -15,3 +15,10 @@ coverage
 # Optional: Ignore build artifacts
 build
 output/
+
+
+
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

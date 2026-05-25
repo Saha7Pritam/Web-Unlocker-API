@@ -19,10 +19,12 @@
   "dependencies": {
     "@azure/cosmos": "^4.9.3",
     "@azure/identity": "^4.13.1",
+    "@azure/msal-node": "^5.2.2",
     "cheerio": "^1.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-session": "^1.19.0",
     "mssql": "^12.5.1",
     "uuid": "^14.0.0"
   }
