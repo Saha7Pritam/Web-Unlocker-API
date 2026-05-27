@@ -537,6 +537,227 @@ app.patch('/api/update-pp', requireAuth, async (req, res) => {
 
 
 
+
+
+
+// ── GET /api/pp-template-csv ──────────────────────────────────
+// Returns a blank CSV template with just the headers SKU,PP.
+// The frontend triggers a file download when this is called.
+//
+// Simple: no DB call needed — it's just headers.
+// The user fills in SKUs and prices themselves.
+ 
+app.get('/api/pp-template-csv', requireAuth, (req, res) => {
+  const csvContent = 'SKU,PP\n';
+ 
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="pp_update_template.csv"');
+  res.send(csvContent);
+});
+ 
+ 
+// ── POST /api/validate-skus ───────────────────────────────────
+// Checks which SKUs from the uploaded CSV actually exist in
+// InternalProducts. Called after client-side parse, before
+// showing the preview table — so the user sees SKU-not-found
+// errors before trying to import.
+//
+// Body: { skus: string[] }
+// Returns: { valid: string[], notFound: string[] }
+//
+// Uses a single IN query — fast even for 1000+ SKUs.
+ 
+app.post('/api/validate-skus', requireAuth, async (req, res) => {
+  const { skus } = req.body;
+ 
+  if (!Array.isArray(skus) || skus.length === 0) {
+    return res.status(400).json({ success: false, error: 'skus must be a non-empty array' });
+  }
+ 
+  // Hard cap — if someone uploads a 10,000 row CSV something is wrong
+  if (skus.length > 2000) {
+    return res.status(400).json({
+      success: false,
+      error: `Too many SKUs (${skus.length}). Maximum 2000 rows per upload.`,
+    });
+  }
+ 
+  let pool;
+  try {
+    pool = await getSqlPool();
+ 
+    // Build a TVP-style check using a VALUES table constructor.
+    // mssql doesn't support array binding directly for IN clauses,
+    // so we insert into a temp table and JOIN.
+    //
+    // Approach: create a temp table, bulk insert the SKUs, then LEFT JOIN
+    // against InternalProducts to find which ones don't exist.
+ 
+    // Create temp table for this session
+    await pool.request().query(`
+      CREATE TABLE #SkuCheck (SKU NVARCHAR(100))
+    `);
+ 
+    // Insert in batches of 100 to avoid hitting parameter limits
+    const BATCH = 100;
+    for (let i = 0; i < skus.length; i += BATCH) {
+      const batch  = skus.slice(i, i + BATCH);
+      const values = batch
+        .map((_, idx) => `(@s${i + idx})`)
+        .join(',');
+ 
+      const req2 = pool.request();
+      batch.forEach((sku, idx) => {
+        req2.input(`s${i + idx}`, sql.NVarChar(100), sku);
+      });
+      await req2.query(`INSERT INTO #SkuCheck (SKU) VALUES ${values}`);
+    }
+ 
+    // Find which submitted SKUs don't exist in InternalProducts
+    const result = await pool.request().query(`
+      SELECT c.SKU
+      FROM #SkuCheck c
+      LEFT JOIN InternalProducts ip ON ip.SKU_ID = c.SKU
+      WHERE ip.SKU_ID IS NULL
+    `);
+ 
+    const notFound = result.recordset.map(r => r.SKU);
+    const valid    = skus.filter(s => !notFound.includes(s));
+ 
+    console.log(`✅ /api/validate-skus — ${skus.length} checked | ${notFound.length} not found`);
+    res.json({ valid, notFound });
+ 
+  } catch (err) {
+    console.error('❌ /api/validate-skus error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) {
+      // Clean up temp table
+      try { await pool.request().query('DROP TABLE IF EXISTS #SkuCheck'); } catch (_) {}
+      await pool.close();
+    }
+  }
+});
+ 
+ 
+// ── POST /api/bulk-update-pp ──────────────────────────────────
+// Updates PP for multiple SKUs in a single TVP MERGE.
+// Mirrors the same pattern as internal_db_sync — one round trip.
+//
+// Body: { rows: [{ skuId: string, newPP: number }] }
+//
+// Writes for each row:
+//   PP                 = newPP
+//   ManualPP_UpdatedAt = GETDATE()
+//   ManualPP_UpdatedBy = logged-in user email
+//
+// Does NOT touch LastBillDate, RecommendedSP, or any other column.
+// Returns: { updated: number, updatedBy: string, updatedAt: string }
+ 
+app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
+  const { rows } = req.body;
+ 
+  // ── Validation ────────────────────────────────────────────
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ success: false, error: 'rows must be a non-empty array' });
+  }
+ 
+  if (rows.length > 2000) {
+    return res.status(400).json({
+      success: false,
+      error: `Too many rows (${rows.length}). Maximum 2000 rows per upload.`,
+    });
+  }
+ 
+  // Validate every row before touching the DB
+  for (const row of rows) {
+    if (!row.skuId || typeof row.skuId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Each row must have a skuId string' });
+    }
+    const pp = parseFloat(row.newPP);
+    if (isNaN(pp) || pp <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid PP for SKU "${row.skuId}": must be a positive number`,
+      });
+    }
+  }
+ 
+  const updatedBy = req.session?.user?.email || 'unknown';
+  const updatedAt = new Date().toISOString();
+ 
+  let pool;
+  try {
+    pool = await getSqlPool();
+ 
+    // ── Build TVP ─────────────────────────────────────────
+    // Use a temp table approach (same as validate-skus) since
+    // mssql TVP types need to be pre-defined in SQL Server.
+    // We use a simple temp table + UPDATE JOIN instead.
+ 
+    // Create temp table
+    await pool.request().query(`
+      CREATE TABLE #BulkPP (
+        SKU_ID NVARCHAR(100),
+        NewPP  DECIMAL(10, 2)
+      )
+    `);
+ 
+    // Insert rows in batches of 100
+    const BATCH = 100;
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const batch  = rows.slice(i, i + BATCH);
+      const values = batch
+        .map((_, idx) => `(@sku${i + idx}, @pp${i + idx})`)
+        .join(',');
+ 
+      const req2 = pool.request();
+      batch.forEach((row, idx) => {
+        req2.input(`sku${i + idx}`, sql.NVarChar(100),  row.skuId);
+        req2.input(`pp${i + idx}`,  sql.Decimal(10, 2), parseFloat(row.newPP));
+      });
+      await req2.query(`INSERT INTO #BulkPP (SKU_ID, NewPP) VALUES ${values}`);
+    }
+ 
+    // ── Single UPDATE JOIN — one round trip for all rows ──
+    const updateResult = await pool.request()
+      .input('UpdatedBy', sql.NVarChar(150), updatedBy)
+      .query(`
+        UPDATE ip
+        SET
+          ip.PP                 = b.NewPP,
+          ip.ManualPP_UpdatedAt = GETDATE(),
+          ip.ManualPP_UpdatedBy = @UpdatedBy
+        FROM InternalProducts ip
+        INNER JOIN #BulkPP b ON b.SKU_ID = ip.SKU_ID;
+ 
+        SELECT @@ROWCOUNT AS updated;
+      `);
+ 
+    const updated = updateResult.recordset[0]?.updated ?? rows.length;
+ 
+    console.log(`✅ /api/bulk-update-pp — ${updated} rows updated | By: ${updatedBy}`);
+ 
+    res.json({
+      success: true,
+      data: { updated, updatedBy, updatedAt },
+    });
+ 
+  } catch (err) {
+    console.error('❌ /api/bulk-update-pp error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) {
+      try { await pool.request().query('DROP TABLE IF EXISTS #BulkPP'); } catch (_) {}
+      await pool.close();
+    }
+  }
+});
+
+
+
+
+
 // ── Health check ──────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
