@@ -567,75 +567,54 @@ app.get('/api/pp-template-csv', requireAuth, (req, res) => {
 //
 // Uses a single IN query — fast even for 1000+ SKUs.
  
+// ── POST /api/validate-skus ───────────────────────────────────
 app.post('/api/validate-skus', requireAuth, async (req, res) => {
   const { skus } = req.body;
- 
+
   if (!Array.isArray(skus) || skus.length === 0) {
     return res.status(400).json({ success: false, error: 'skus must be a non-empty array' });
   }
- 
-  // Hard cap — if someone uploads a 10,000 row CSV something is wrong
+
   if (skus.length > 2000) {
     return res.status(400).json({
       success: false,
       error: `Too many SKUs (${skus.length}). Maximum 2000 rows per upload.`,
     });
   }
- 
+
   let pool;
   try {
     pool = await getSqlPool();
- 
-    // Build a TVP-style check using a VALUES table constructor.
-    // mssql doesn't support array binding directly for IN clauses,
-    // so we insert into a temp table and JOIN.
-    //
-    // Approach: create a temp table, bulk insert the SKUs, then LEFT JOIN
-    // against InternalProducts to find which ones don't exist.
- 
-    // Create temp table for this session
-    await pool.request().query(`
-      CREATE TABLE #SkuCheck (SKU NVARCHAR(100))
+
+    // Build parameterized IN clause — no temp tables needed
+    // mssql supports up to ~2100 parameters per query, we're well within that
+    const request = pool.request();
+    const paramNames = skus.map((sku, i) => {
+      request.input(`sku${i}`, sql.NVarChar(100), sku);
+      return `@sku${i}`;
+    });
+
+    const inClause = paramNames.join(',');
+
+    // Find which submitted SKUs exist in InternalProducts
+    const result = await request.query(`
+      SELECT SKU_ID
+      FROM InternalProducts
+      WHERE SKU_ID IN (${inClause})
     `);
- 
-    // Insert in batches of 100 to avoid hitting parameter limits
-    const BATCH = 100;
-    for (let i = 0; i < skus.length; i += BATCH) {
-      const batch  = skus.slice(i, i + BATCH);
-      const values = batch
-        .map((_, idx) => `(@s${i + idx})`)
-        .join(',');
- 
-      const req2 = pool.request();
-      batch.forEach((sku, idx) => {
-        req2.input(`s${i + idx}`, sql.NVarChar(100), sku);
-      });
-      await req2.query(`INSERT INTO #SkuCheck (SKU) VALUES ${values}`);
-    }
- 
-    // Find which submitted SKUs don't exist in InternalProducts
-    const result = await pool.request().query(`
-      SELECT c.SKU
-      FROM #SkuCheck c
-      LEFT JOIN InternalProducts ip ON ip.SKU_ID = c.SKU
-      WHERE ip.SKU_ID IS NULL
-    `);
- 
-    const notFound = result.recordset.map(r => r.SKU);
-    const valid    = skus.filter(s => !notFound.includes(s));
- 
+
+    const foundSet  = new Set(result.recordset.map(r => r.SKU_ID));
+    const notFound  = skus.filter(s => !foundSet.has(s));
+    const valid     = skus.filter(s =>  foundSet.has(s));
+
     console.log(`✅ /api/validate-skus — ${skus.length} checked | ${notFound.length} not found`);
     res.json({ valid, notFound });
- 
+
   } catch (err) {
-    console.error('❌ /api/validate-skus error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) {
-      // Clean up temp table
-      try { await pool.request().query('DROP TABLE IF EXISTS #SkuCheck'); } catch (_) {}
-      await pool.close();
-    }
+  console.error('❌ /api/validate-skus FULL error:', err.message, err.code, err.stack);
+  res.status(500).json({ success: false, error: err.message, code: err.code });
+} finally {
+    if (pool) await pool.close();
   }
 });
  
@@ -654,22 +633,21 @@ app.post('/api/validate-skus', requireAuth, async (req, res) => {
 // Does NOT touch LastBillDate, RecommendedSP, or any other column.
 // Returns: { updated: number, updatedBy: string, updatedAt: string }
  
+// ── POST /api/bulk-update-pp ──────────────────────────────────
 app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
   const { rows } = req.body;
- 
-  // ── Validation ────────────────────────────────────────────
+
   if (!Array.isArray(rows) || rows.length === 0) {
     return res.status(400).json({ success: false, error: 'rows must be a non-empty array' });
   }
- 
+
   if (rows.length > 2000) {
     return res.status(400).json({
       success: false,
       error: `Too many rows (${rows.length}). Maximum 2000 rows per upload.`,
     });
   }
- 
-  // Validate every row before touching the DB
+
   for (const row of rows) {
     if (!row.skuId || typeof row.skuId !== 'string') {
       return res.status(400).json({ success: false, error: 'Each row must have a skuId string' });
@@ -682,77 +660,52 @@ app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
       });
     }
   }
- 
+
   const updatedBy = req.session?.user?.email || 'unknown';
   const updatedAt = new Date().toISOString();
- 
+
   let pool;
   try {
     pool = await getSqlPool();
- 
-    // ── Build TVP ─────────────────────────────────────────
-    // Use a temp table approach (same as validate-skus) since
-    // mssql TVP types need to be pre-defined in SQL Server.
-    // We use a simple temp table + UPDATE JOIN instead.
- 
-    // Create temp table
-    await pool.request().query(`
-      CREATE TABLE #BulkPP (
-        SKU_ID NVARCHAR(100),
-        NewPP  DECIMAL(10, 2)
-      )
-    `);
- 
-    // Insert rows in batches of 100
-    const BATCH = 100;
-    for (let i = 0; i < rows.length; i += BATCH) {
-      const batch  = rows.slice(i, i + BATCH);
-      const values = batch
-        .map((_, idx) => `(@sku${i + idx}, @pp${i + idx})`)
-        .join(',');
- 
-      const req2 = pool.request();
-      batch.forEach((row, idx) => {
-        req2.input(`sku${i + idx}`, sql.NVarChar(100),  row.skuId);
-        req2.input(`pp${i + idx}`,  sql.Decimal(10, 2), parseFloat(row.newPP));
-      });
-      await req2.query(`INSERT INTO #BulkPP (SKU_ID, NewPP) VALUES ${values}`);
+
+    // Update each row individually but in a tight loop —
+    // fast enough for ≤2000 rows, no temp table needed,
+    // and each UPDATE is atomic per SKU.
+    let updated = 0;
+
+    for (const row of rows) {
+      const result = await pool.request()
+        .input('SKU_ID',    sql.NVarChar(100),  row.skuId)
+        .input('PP',        sql.Decimal(10, 2), parseFloat(row.newPP))
+        .input('UpdatedBy', sql.NVarChar(150),  updatedBy)
+        .query(`
+          UPDATE InternalProducts
+          SET
+            PP                 = @PP,
+            ManualPP_UpdatedAt = GETDATE(),
+            ManualPP_UpdatedBy = @UpdatedBy
+          WHERE SKU_ID = @SKU_ID
+        `);
+
+      if (result.rowsAffected[0] > 0) updated++;
     }
- 
-    // ── Single UPDATE JOIN — one round trip for all rows ──
-    const updateResult = await pool.request()
-      .input('UpdatedBy', sql.NVarChar(150), updatedBy)
-      .query(`
-        UPDATE ip
-        SET
-          ip.PP                 = b.NewPP,
-          ip.ManualPP_UpdatedAt = GETDATE(),
-          ip.ManualPP_UpdatedBy = @UpdatedBy
-        FROM InternalProducts ip
-        INNER JOIN #BulkPP b ON b.SKU_ID = ip.SKU_ID;
- 
-        SELECT @@ROWCOUNT AS updated;
-      `);
- 
-    const updated = updateResult.recordset[0]?.updated ?? rows.length;
- 
+
     console.log(`✅ /api/bulk-update-pp — ${updated} rows updated | By: ${updatedBy}`);
- 
+
     res.json({
       success: true,
       data: { updated, updatedBy, updatedAt },
     });
- 
+
   } catch (err) {
     console.error('❌ /api/bulk-update-pp error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
-    if (pool) {
-      try { await pool.request().query('DROP TABLE IF EXISTS #BulkPP'); } catch (_) {}
-      await pool.close();
-    }
+    if (pool) await pool.close();
   }
 });
+
+
 
 
 
@@ -762,6 +715,8 @@ app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+
 
 app.listen(PORT, () => {
   console.log(`🚀 API server running at http://localhost:${PORT}`);
