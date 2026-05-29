@@ -5,13 +5,14 @@ require('dotenv').config();
 const express  = require('express');
 const cors     = require('cors');
 const sql      = require('mssql');
+const { v4: uuidv4 } = require('uuid');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
 
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
 const { STORES }           = require('./urls');
 
-const session    = require('express-session');
+const session        = require('express-session');
 const { msalClient } = require('./auth/msalConfig');
 const { requireAuth } = require('./auth/authMiddleware');
 
@@ -24,47 +25,39 @@ app.use(cors({
 }));
 app.use(express.json());
 
-
-// ── Session middleware (add near top, after cors/json) ────────
+// ── Session middleware ────────────────────────────────────────
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
-  resave: false,
+  secret           : process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
+  resave           : false,
   saveUninitialized: false,
-  cookie: { secure: false }, // true in production (HTTPS)
+  cookie           : { secure: false }, // true in production (HTTPS)
 }));
 
 // ── GET /auth/login ───────────────────────────────────────────
-// Generates Microsoft login URL and redirects browser to it
 app.get('/auth/login', async (req, res) => {
   const authCodeUrlParams = {
-    scopes      : ['user.read'],
-    redirectUri : process.env.REDIRECT_URI,
+    scopes     : ['user.read'],
+    redirectUri: process.env.REDIRECT_URI,
   };
   const authUrl = await msalClient.getAuthCodeUrl(authCodeUrlParams);
   res.redirect(authUrl);
 });
 
-// ── GET /callback ────────────────────────────────────────
-// Microsoft redirects here after login with a code
+// ── GET /callback ─────────────────────────────────────────────
 app.get('/callback', async (req, res) => {
   const tokenRequest = {
-    code        : req.query.code,
-    scopes      : ['user.read'],
-    redirectUri : process.env.REDIRECT_URI,
+    code       : req.query.code,
+    scopes     : ['user.read'],
+    redirectUri: process.env.REDIRECT_URI,
   };
-
   try {
     const response = await msalClient.acquireTokenByCode(tokenRequest);
-
-    // Store user info in session
     req.session.user = {
-      name  : response.account.name,
-      email : response.account.username,  // this is their @tpstech.in email
-      role  : 'sales', // hardcode for now — replace with Azure AD group check later
+      name : response.account.name,
+      email: response.account.username,
+      role : 'sales',
     };
-
     res.redirect(process.env.FRONTEND_URL || 'http://localhost:5173');
-
   } catch (err) {
     console.error('Auth callback error:', err.message);
     res.status(500).send('Login failed');
@@ -72,7 +65,6 @@ app.get('/callback', async (req, res) => {
 });
 
 // ── GET /auth/me ──────────────────────────────────────────────
-// Frontend calls this on load to check if user is logged in
 app.get('/auth/me', (req, res) => {
   if (!req.session?.user) {
     return res.status(401).json({ authenticated: false });
@@ -112,17 +104,15 @@ async function getSqlPool() {
 }
 
 // ── Helper: find store config by product URL ──────────────────
-// Matches the URL domain against known store names in urls.js
 function findStoreByUrl(productUrl) {
   const domainMap = {
-    'primeabgb.com'         : 'primeabgb',
-    'mdcomputers.in'        : 'mdcomputers',
-    'pickpcparts.in'        : 'pickpcparts',
-    'vedantcomputers.com'   : 'vedant',
-    'vishalperipherals.com' : 'vishal',
-    'pcstudio.in'           : 'pcstudio',
+    'primeabgb.com'        : 'primeabgb',
+    'mdcomputers.in'       : 'mdcomputers',
+    'pickpcparts.in'       : 'pickpcparts',
+    'vedantcomputers.com'  : 'vedant',
+    'vishalperipherals.com': 'vishal',
+    'pcstudio.in'          : 'pcstudio',
   };
-
   for (const [domain, storeName] of Object.entries(domainMap)) {
     if (productUrl.includes(domain)) {
       return STORES.find(s => s.name === storeName) || null;
@@ -132,26 +122,19 @@ function findStoreByUrl(productUrl) {
 }
 
 // ── Helper: recalculate RecommendedSP for one SKU ────────────
-// Mirrors the recommendation engine logic for a single product.
-// Called after manual refresh so the UI shows the updated price immediately.
 async function recalculateRecommendedSP(pool, skuId) {
   const GST               = 0.18;
   const COST_OF_BUSINESS  = 0.07;
   const MIN_PROFIT_MARGIN = 0.05;
 
-  // Get PP for this SKU
   const productResult = await pool.request()
     .input('SKU_ID', sql.NVarChar(100), skuId)
-    .query(`
-      SELECT PP FROM InternalProducts
-      WHERE SKU_ID = @SKU_ID AND PP IS NOT NULL
-    `);
+    .query(`SELECT PP FROM InternalProducts WHERE SKU_ID = @SKU_ID AND PP IS NOT NULL`);
 
   if (!productResult.recordset.length) return null;
 
   const pp = parseFloat(productResult.recordset[0].PP);
 
-  // Get lowest in-stock competitor price for this SKU
   const competitorResult = await pool.request()
     .input('SKU', sql.NVarChar(100), skuId)
     .query(`
@@ -174,26 +157,28 @@ async function recalculateRecommendedSP(pool, skuId) {
     if (target > basePrice) recommendedSP = target;
   }
 
-  // Update InternalProducts
   await pool.request()
     .input('SKU_ID',        sql.NVarChar(100),  skuId)
     .input('RecommendedSP', sql.Decimal(10, 2), recommendedSP)
     .query(`
       UPDATE InternalProducts
-      SET RecommendedSP          = @RecommendedSP,
-          RecommendedSPUpdatedAt = GETDATE()
+      SET RecommendedSP = @RecommendedSP, RecommendedSPUpdatedAt = GETDATE()
       WHERE SKU_ID = @SKU_ID
     `);
 
   return recommendedSP;
 }
 
+
+// ─────────────────────────────────────────────────────────────
+// ROUTES
+// ─────────────────────────────────────────────────────────────
+
 // ── GET /api/recommendations ──────────────────────────────────
 app.get('/api/recommendations', async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
-
     const result = await pool.request().query(`
       SELECT
         i.SKU_ID,
@@ -207,39 +192,23 @@ app.get('/api/recommendations', async (req, res) => {
           2
         ) AS ExtraProfitPct,
         c.CompetitorPrice,
-        c.ProductURL      AS CompetitorURL,
+        c.ProductURL   AS CompetitorURL,
         c.StoreName,
-        c.StockStatus     AS CompetitorStockStatus
-
+        c.StockStatus  AS CompetitorStockStatus
       FROM InternalProducts i
-
       INNER JOIN (
-        SELECT
-          SKU,
-          CompetitorPrice,
-          ProductURL,
-          StoreName,
-          StockStatus,
-          ROW_NUMBER() OVER (
-            PARTITION BY SKU
-            ORDER BY CompetitorPrice ASC
-          ) AS rn
+        SELECT SKU, CompetitorPrice, ProductURL, StoreName, StockStatus,
+          ROW_NUMBER() OVER (PARTITION BY SKU ORDER BY CompetitorPrice ASC) AS rn
         FROM CompetitorPrices
         WHERE CompetitorPrice IS NOT NULL
           AND LOWER(StockStatus) != 'out of stock'
       ) c ON c.SKU = i.SKU_ID AND c.rn = 1
-
-      WHERE i.PP          IS NOT NULL
-        AND i.isActive    = 1
-        AND i.isInStock   = 1
-        AND i.RecommendedSP IS NOT NULL
-
+      WHERE i.PP IS NOT NULL AND i.isActive = 1
+        AND i.isInStock = 1 AND i.RecommendedSP IS NOT NULL
       ORDER BY i.SKU_ID
     `);
-
     console.log(`✅ /api/recommendations — ${result.recordset.length} rows served`);
     res.json({ success: true, data: result.recordset });
-
   } catch (err) {
     console.error('❌ API error:', err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -249,82 +218,41 @@ app.get('/api/recommendations', async (req, res) => {
 });
 
 
-
 // ── POST /api/refresh-product ─────────────────────────────────
-// Manual single-product refresh triggered from UI.
-//
-// Body: { competitorUrl: string, skuId: string }
-//   competitorUrl — the competitor product page URL to re-scrape
-//   skuId         — our internal SKU_ID to update RecommendedSP for
-//
-// Flow:
-//   1. Identify store from URL domain
-//   2. Scrape the product page via Web Unlocker
-//   3. Upsert new price into CompetitorPrices SQL table
-//   4. Recalculate RecommendedSP for this SKU
-//   5. Update LastManualRefreshAt + LastManualRefreshBy
-//   6. Return updated product data to UI
-//
-// Does NOT touch LastScrapedAt / NextScrapDueAt (auto scheduler only).
-
-
 app.post('/api/refresh-product', async (req, res) => {
   const { competitorUrl, skuId } = req.body;
-
-  // ── Validation ────────────────────────────────────────────
   if (!competitorUrl || !skuId) {
-    return res.status(400).json({
-      success: false,
-      error  : 'Both competitorUrl and skuId are required',
-    });
+    return res.status(400).json({ success: false, error: 'Both competitorUrl and skuId are required' });
   }
-
   console.log(`\n🔄 Manual refresh: SKU=${skuId} | URL=${competitorUrl}`);
 
-  // ── Step 1: Find store config from URL ────────────────────
   const store = findStoreByUrl(competitorUrl);
   if (!store) {
     return res.status(400).json({
       success: false,
-      error  : `Unknown store URL. Supported: primeabgb, mdcomputers, pickpcparts, vedant, vishal, pcstudio`,
+      error: 'Unknown store URL. Supported: primeabgb, mdcomputers, pickpcparts, vedant, vishal, pcstudio',
     });
   }
-
   console.log(`   Store identified: ${store.name}`);
 
   let pool;
   try {
-    // ── Step 2: Scrape the product page ───────────────────
     console.log(`   Scraping: ${competitorUrl}`);
     const product = await scrapeProduct(store, competitorUrl);
-
     if (!product || !product.name) {
-      return res.status(422).json({
-        success: false,
-        error  : 'Scraping succeeded but no product data found on this page',
-      });
+      return res.status(422).json({ success: false, error: 'Scraping succeeded but no product data found' });
     }
-
     console.log(`   Scraped: ${product.name}`);
 
-    // ── Step 3: Upsert into CompetitorPrices ──────────────
     const upserted = await upsertOneProduct(product);
-
     if (!upserted) {
-      return res.status(422).json({
-        success: false,
-        error  : 'Product scraped but SKU could not be mapped — check parser for this store',
-      });
+      return res.status(422).json({ success: false, error: 'Product scraped but SKU could not be mapped' });
     }
 
-    // ── Step 4: Recalculate RecommendedSP ─────────────────
     pool = await getSqlPool();
     const newRecommendedSP = await recalculateRecommendedSP(pool, skuId);
 
-    // ── Step 5: Update manual refresh audit columns ───────
-    // ONLY writes LastManualRefreshAt + LastManualRefreshBy.
-    // NEVER touches LastScrapedAt or NextScrapDueAt (auto scheduler owns those).
-    const refreshedBy = req.headers['x-user-email'] || 'manual'; // real email after auth added
+    const refreshedBy = req.headers['x-user-email'] || 'manual';
     const refreshedAt = new Date().toISOString();
 
     await pool.request()
@@ -339,19 +267,10 @@ app.post('/api/refresh-product', async (req, res) => {
       `);
 
     console.log(`   ✅ Done — RecommendedSP: ₹${newRecommendedSP} | RefreshedBy: ${refreshedBy}`);
-
-    // ── Step 6: Return updated data to UI ─────────────────
     res.json({
-      success          : true,
-      skuId,
-      storeName        : store.name,
-      productName      : product.name,
-      newCompetitorPrice: upserted.CompetitorPrice,
-      newRecommendedSP,
-      refreshedAt,
-      refreshedBy,
+      success: true, skuId, storeName: store.name, productName: product.name,
+      newCompetitorPrice: upserted.CompetitorPrice, newRecommendedSP, refreshedAt, refreshedBy,
     });
-
   } catch (err) {
     console.error(`❌ Manual refresh failed: ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
@@ -361,46 +280,24 @@ app.post('/api/refresh-product', async (req, res) => {
 });
 
 
-
-// ── ADD this block to src/api_server.js ──────────────────────
-// Place it anywhere after getSqlPool() is defined,
-// alongside the other app.get / app.post routes.
-//
-// GET /api/competitor-details/:skuId
-// ─────────────────────────────────────────────────────────────
-// Returns up to 4 in-stock competitors for a single SKU,
-// ranked by CompetitorPrice ASC.
-// Called lazily by CompetitorCell on first hover/expand.
-// The /api/recommendations endpoint is NOT changed.
-
+// ── GET /api/competitor-details/:skuId ───────────────────────
 app.get('/api/competitor-details/:skuId', async (req, res) => {
   const { skuId } = req.params;
-
-  if (!skuId) {
-    return res.status(400).json({ success: false, error: 'skuId is required' });
-  }
+  if (!skuId) return res.status(400).json({ success: false, error: 'skuId is required' });
 
   let pool;
   try {
     pool = await getSqlPool();
-
     const result = await pool.request()
       .input('SKU', sql.NVarChar(100), skuId)
       .query(`
-        SELECT TOP 4
-          CompetitorPrice,
-          ProductURL,
-          StoreName,
-          StockStatus
+        SELECT TOP 4 CompetitorPrice, ProductURL, StoreName, StockStatus
         FROM CompetitorPrices
-        WHERE SKU             = @SKU
-          AND CompetitorPrice IS NOT NULL
+        WHERE SKU = @SKU AND CompetitorPrice IS NOT NULL
           AND LOWER(StockStatus) != 'out of stock'
         ORDER BY CompetitorPrice ASC
       `);
-
     res.json({ success: true, data: result.recordset });
-
   } catch (err) {
     console.error(`❌ /api/competitor-details/${skuId}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -410,47 +307,27 @@ app.get('/api/competitor-details/:skuId', async (req, res) => {
 });
 
 
-
-
-// Both routes use requireAuth middleware — already imported in api_server.js.
-
 // ── GET /api/pp-products ──────────────────────────────────────
-// Returns all internal products for the PP Update table in the UI.
-// Includes PP, LastBillDate, ManualPP_UpdatedAt, ManualPP_UpdatedBy
-// so the UI can show audit info next to each row.
 app.get('/api/pp-products', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
-
     const result = await pool.request().query(`
       SELECT
-        SKU_ID,
-        Title,
-        Category,
-        Brand,
-        PP,
-        LastBillDate,
-        ManualPP_UpdatedAt,
-        ManualPP_UpdatedBy,
-        -- Effective PP source for display
+        SKU_ID, Title, Category, Brand, PP,
+        LastBillDate, ManualPP_UpdatedAt, ManualPP_UpdatedBy,
         CASE
-          WHEN ManualPP_UpdatedAt IS NOT NULL
-           AND LastBillDate IS NOT NULL
-           AND ManualPP_UpdatedAt >= CAST(LastBillDate AS DATETIME2)
-            THEN 'manual'
-          WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NULL
-            THEN 'manual'
+          WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NOT NULL
+           AND ManualPP_UpdatedAt >= CAST(LastBillDate AS DATETIME2) THEN 'manual'
+          WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NULL THEN 'manual'
           ELSE 'bill'
         END AS PPSource
       FROM InternalProducts
       WHERE isActive = 1
       ORDER BY Category, Title
     `);
-
     console.log(`✅ /api/pp-products — ${result.recordset.length} rows`);
     res.json({ success: true, data: result.recordset });
-
   } catch (err) {
     console.error('❌ /api/pp-products error:', err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -461,70 +338,38 @@ app.get('/api/pp-products', requireAuth, async (req, res) => {
 
 
 // ── PATCH /api/update-pp ──────────────────────────────────────
-// Manually override PP for a single SKU.
-//
-// Body: { skuId: string, newPP: number }
-//
-// Writes:
-//   PP               = newPP           (overwrites bill PP)
-//   ManualPP_UpdatedAt = GETDATE()     (audit: when)
-//   ManualPP_UpdatedBy = user email    (audit: who)
-//
-// Does NOT touch LastBillDate — that is owned by internal_db_sync.
-// Does NOT touch RecommendedSP — that is recalculated by recommendation_engine.
-//   (Run the engine after a batch of PP updates to refresh RecommendedSP values.)
-
 app.patch('/api/update-pp', requireAuth, async (req, res) => {
   const { skuId, newPP } = req.body;
-
   if (!skuId || newPP == null) {
     return res.status(400).json({ success: false, error: 'skuId and newPP are required' });
   }
-
   const parsedPP = parseFloat(newPP);
   if (isNaN(parsedPP) || parsedPP <= 0) {
     return res.status(400).json({ success: false, error: 'newPP must be a positive number' });
   }
 
-  // Get the logged-in user's email from session (set during Microsoft auth callback)
   const updatedBy = req.session?.user?.email || 'unknown';
-
   let pool;
   try {
     pool = await getSqlPool();
-
     const result = await pool.request()
-      .input('SKU_ID',            sql.NVarChar(100),  skuId)
-      .input('PP',                sql.Decimal(10, 2), parsedPP)
-      .input('ManualPP_UpdatedBy',sql.NVarChar(150),  updatedBy)
+      .input('SKU_ID',             sql.NVarChar(100),  skuId)
+      .input('PP',                 sql.Decimal(10, 2), parsedPP)
+      .input('ManualPP_UpdatedBy', sql.NVarChar(150),  updatedBy)
       .query(`
         UPDATE InternalProducts
-        SET
-          PP                 = @PP,
-          ManualPP_UpdatedAt = GETDATE(),
-          ManualPP_UpdatedBy = @ManualPP_UpdatedBy
+        SET PP = @PP, ManualPP_UpdatedAt = GETDATE(), ManualPP_UpdatedBy = @ManualPP_UpdatedBy
         WHERE SKU_ID = @SKU_ID;
 
-        -- Return the updated row so the UI can refresh immediately
-        SELECT
-          SKU_ID,
-          PP,
-          ManualPP_UpdatedAt,
-          ManualPP_UpdatedBy,
-          LastBillDate
-        FROM InternalProducts
-        WHERE SKU_ID = @SKU_ID;
+        SELECT SKU_ID, PP, ManualPP_UpdatedAt, ManualPP_UpdatedBy, LastBillDate
+        FROM InternalProducts WHERE SKU_ID = @SKU_ID;
       `);
 
     if (!result.recordset.length) {
       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
     }
-
-    const updated = result.recordset[0];
     console.log(`✅ PP updated: SKU=${skuId} | PP=₹${parsedPP} | By=${updatedBy}`);
-
-    res.json({ success: true, data: updated });
-
+    res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
     console.error(`❌ /api/update-pp error for ${skuId}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -534,13 +379,293 @@ app.patch('/api/update-pp', requireAuth, async (req, res) => {
 });
 
 
+// ── GET /api/pp-template-csv ──────────────────────────────────
+// Returns a blank CSV template — just headers SKU,PP
+app.get('/api/pp-template-csv', requireAuth, (req, res) => {
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="pp_update_template.csv"');
+  res.send('SKU,PP\n');
+});
 
 
+// ── POST /api/validate-skus ───────────────────────────────────
+// UPDATED: now returns currentPP alongside each matched SKU
+// so the frontend can show ±% change warning in the preview.
+//
+// Body:    { skus: string[] }
+// Returns: { valid: [{ sku, currentPP }], notFound: string[] }
 
-// ── Health check ──────────────────────────────────────────────
+app.post('/api/validate-skus', requireAuth, async (req, res) => {
+  const { skus } = req.body;
+
+  if (!Array.isArray(skus) || skus.length === 0) {
+    return res.status(400).json({ success: false, error: 'skus must be a non-empty array' });
+  }
+  if (skus.length > 2000) {
+    return res.status(400).json({
+      success: false,
+      error: `Too many SKUs (${skus.length}). Maximum 2000 rows per upload.`,
+    });
+  }
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    // Build parameterized IN clause — fetch SKU_ID + current PP in one query
+    const request    = pool.request();
+    const paramNames = skus.map((sku, i) => {
+      request.input(`sku${i}`, sql.NVarChar(100), sku);
+      return `@sku${i}`;
+    });
+
+    const result = await request.query(`
+      SELECT SKU_ID, PP
+      FROM InternalProducts
+      WHERE SKU_ID IN (${paramNames.join(',')})
+    `);
+
+    // Map: SKU_ID → currentPP
+    const foundMap = new Map();
+    for (const row of result.recordset) {
+      foundMap.set(row.SKU_ID, row.PP != null ? parseFloat(row.PP) : null);
+    }
+
+    const valid    = [];
+    const notFound = [];
+
+    for (const sku of skus) {
+      if (foundMap.has(sku)) {
+        valid.push({ sku, currentPP: foundMap.get(sku) });
+      } else {
+        notFound.push(sku);
+      }
+    }
+
+    console.log(`✅ /api/validate-skus — ${skus.length} checked | ${notFound.length} not found`);
+    res.json({ valid, notFound });
+
+  } catch (err) {
+    console.error('❌ /api/validate-skus error:', err.message, err.stack);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── POST /api/bulk-update-pp ──────────────────────────────────
+// UPDATED: now accepts unidentified rows, saves a BulkUploadSession
+// record, and logs unidentified SKUs to UnIdentifiedProducts table.
+//
+// Body: {
+//   rows:         [{ skuId, newPP }],   — valid matched rows
+//   unidentified: [{ sku, pp }],        — SKUs not found in DB
+//   fileName:     string                — original CSV filename
+// }
+// Returns: { sessionId, updated, unidentifiedCount, updatedBy, updatedAt }
+
+app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
+  const { rows = [], unidentified = [], fileName = '' } = req.body;
+
+  if (rows.length === 0 && unidentified.length === 0) {
+    return res.status(400).json({ success: false, error: 'Nothing to process' });
+  }
+  if (rows.length > 2000) {
+    return res.status(400).json({
+      success: false,
+      error: `Too many rows (${rows.length}). Maximum 2000 per upload.`,
+    });
+  }
+
+  for (const row of rows) {
+    if (!row.skuId || typeof row.skuId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Each row must have a skuId string' });
+    }
+    const pp = parseFloat(row.newPP);
+    if (isNaN(pp) || pp <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid PP for SKU "${row.skuId}": must be a positive number`,
+      });
+    }
+  }
+
+  const updatedBy = req.session?.user?.email || 'unknown';
+  const updatedAt = new Date().toISOString();
+  const sessionId = uuidv4();
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    // ── Step 1: Update valid PP rows ──────────────────────────
+    let updated = 0;
+    for (const row of rows) {
+      const result = await pool.request()
+        .input('SKU_ID',    sql.NVarChar(100),  row.skuId)
+        .input('PP',        sql.Decimal(10, 2), parseFloat(row.newPP))
+        .input('UpdatedBy', sql.NVarChar(150),  updatedBy)
+        .query(`
+          UPDATE InternalProducts
+          SET PP = @PP, ManualPP_UpdatedAt = GETDATE(), ManualPP_UpdatedBy = @UpdatedBy
+          WHERE SKU_ID = @SKU_ID
+        `);
+      if (result.rowsAffected[0] > 0) updated++;
+    }
+
+    // ── Step 2: Save BulkUploadSession record ─────────────────
+    await pool.request()
+      .input('SessionID',         sql.NVarChar(36),  sessionId)
+      .input('UploadedBy',        sql.NVarChar(150), updatedBy)
+      .input('TotalRowsInCSV',    sql.Int,           rows.length + unidentified.length)
+      .input('UpdatedCount',      sql.Int,           updated)
+      .input('UnidentifiedCount', sql.Int,           unidentified.length)
+      .input('FileName',          sql.NVarChar(500), fileName || '')
+      .query(`
+        INSERT INTO BulkUploadSessions
+          (SessionID, UploadedBy, TotalRowsInCSV, UpdatedCount, UnidentifiedCount, FileName)
+        VALUES
+          (@SessionID, @UploadedBy, @TotalRowsInCSV, @UpdatedCount, @UnidentifiedCount, @FileName)
+      `);
+
+    // ── Step 3: Save UnIdentifiedProducts rows ────────────────
+    if (unidentified.length > 0) {
+      const BATCH = 50;
+      for (let i = 0; i < unidentified.length; i += BATCH) {
+        const batch  = unidentified.slice(i, i + BATCH);
+        const req2   = pool.request();
+        const values = batch.map((row, idx) => {
+          const n = i + idx;
+          req2.input(`sid${n}`,  sql.NVarChar(36),   sessionId);
+          req2.input(`usku${n}`, sql.NVarChar(100),  row.sku ?? '');
+          req2.input(`upp${n}`,  sql.Decimal(10, 2), row.pp  ?? null);
+          req2.input(`uby${n}`,  sql.NVarChar(150),  updatedBy);
+          return `(@sid${n}, @usku${n}, @upp${n}, GETDATE(), @uby${n})`;
+        });
+        await req2.query(`
+          INSERT INTO UnIdentifiedProducts (SessionID, SKU, PP, UploadedAt, UploadedBy)
+          VALUES ${values.join(',')}
+        `);
+      }
+    }
+
+    console.log(`✅ /api/bulk-update-pp — session=${sessionId} | updated=${updated} | unidentified=${unidentified.length} | by=${updatedBy}`);
+
+    res.json({
+      success: true,
+      data: { sessionId, updated, unidentifiedCount: unidentified.length, updatedBy, updatedAt },
+    });
+
+  } catch (err) {
+    console.error('❌ /api/bulk-update-pp error:', err.message, err.stack);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── GET /api/bulk-upload-history ──────────────────────────────
+// Returns list of all past bulk upload sessions, newest first.
+
+app.get('/api/bulk-upload-history', requireAuth, async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request().query(`
+      SELECT TOP 100
+        SessionID, UploadedAt, UploadedBy,
+        TotalRowsInCSV, UpdatedCount, UnidentifiedCount, FileName
+      FROM BulkUploadSessions
+      ORDER BY UploadedAt DESC
+    `);
+    res.json({ success: true, data: result.recordset });
+  } catch (err) {
+    console.error('❌ /api/bulk-upload-history error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── GET /api/bulk-upload-session/:sessionId/unidentified ──────
+// Returns unidentified SKUs for a specific session.
+
+app.get('/api/bulk-upload-session/:sessionId/unidentified', requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('SessionID', sql.NVarChar(36), sessionId)
+      .query(`
+        SELECT SKU, PP, UploadedAt, UploadedBy
+        FROM UnIdentifiedProducts
+        WHERE SessionID = @SessionID
+        ORDER BY SKU
+      `);
+    res.json({ success: true, data: result.recordset });
+  } catch (err) {
+    console.error(`❌ /api/bulk-upload-session/${sessionId}/unidentified:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── GET /api/bulk-upload-session/:sessionId/export ────────────
+// Downloads unidentified SKUs for a session as CSV.
+
+app.get('/api/bulk-upload-session/:sessionId/export', requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const sessionResult = await pool.request()
+      .input('SessionID', sql.NVarChar(36), sessionId)
+      .query(`SELECT UploadedAt FROM BulkUploadSessions WHERE SessionID = @SessionID`);
+
+    const rowsResult = await pool.request()
+      .input('SessionID', sql.NVarChar(36), sessionId)
+      .query(`
+        SELECT SKU, PP, UploadedAt, UploadedBy
+        FROM UnIdentifiedProducts
+        WHERE SessionID = @SessionID
+        ORDER BY SKU
+      `);
+
+    const lines = ['SKU,PP,UploadedAt,UploadedBy'];
+    for (const row of rowsResult.recordset) {
+      const uploadedAt = row.UploadedAt ? new Date(row.UploadedAt).toISOString() : '';
+      lines.push(`${row.SKU},${row.PP ?? ''},${uploadedAt},${row.UploadedBy}`);
+    }
+
+    const sessionDate = sessionResult.recordset[0]?.UploadedAt
+      ? new Date(sessionResult.recordset[0].UploadedAt).toISOString().slice(0, 10)
+      : 'unknown';
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="unidentified_skus_${sessionDate}.csv"`);
+    res.send(lines.join('\n'));
+
+  } catch (err) {
+    console.error(`❌ /api/bulk-upload-session/${sessionId}/export:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── GET /api/health ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
 
 app.listen(PORT, () => {
   console.log(`🚀 API server running at http://localhost:${PORT}`);
