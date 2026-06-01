@@ -1,80 +1,41 @@
 // src/scheduler/index.js
-// ─────────────────────────────────────────────────────────────
-// Auto scrape scheduler.
-//
-// Run manually now:   node src/scheduler/index.js
-// On Azure later:     Azure Timer Trigger Function (daily at midnight)
-//
-// What it does:
-//   1. Reads all distinct categories from InternalProducts
-//   2. For each category, checks if scrape is due
-//      (today >= NextScrapDueAt  OR  NextScrapDueAt is null)
-//   3. Finds the matching store + category config from urls.js
-//   4. Runs the scraper for that category
-//   5. Runs cleanup_mapper (Cosmos → SQL) for new data
-//   6. Runs recommendation engine for affected SKUs
-//   7. Updates LastScrapedAt + NextScrapDueAt in DB
-//
-// Frequency logic:
-//   - If isFreqOverridden = 1 → use ScrapFreq_Override (set via UI)
-//   - If isFreqOverridden = 0 → use DEFAULT_FREQUENCIES map below
-//
-// NOTE: LastScrapedAt is ONLY written here (auto scheduler).
-//       Manual refresh writes LastManualRefreshAt instead.
-//       These two never interfere with each other.
-// ─────────────────────────────────────────────────────────────
+// CHANGE: scrape frequency now comes from CategorySettings table
+// instead of ScrapFreq_Override / isFreqOverridden on InternalProducts.
+// LastScrapedAt and NextScrapDueAt still live on InternalProducts — unchanged.
 
 require('dotenv').config();
 
 const sql      = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
 
-const { STORES }         = require('../urls');
-const { scrapeCategory } = require('../scraper/index');
+const { STORES }               = require('../urls');
+const { scrapeCategory }       = require('../scraper/index');
 const { upsertManyFromCosmos } = require('../services/competitorPriceService');
-const { CosmosClient }   = require('@azure/cosmos');
+const { CosmosClient }         = require('@azure/cosmos');
 
-// ── Default scrape frequencies (days) ────────────────────────
-// Manager confirmed these. Stored here as fallback when
-// isFreqOverridden = 0. When manager sets via UI, isFreqOverridden
-// flips to 1 and ScrapFreq_Override value is used instead.
+// ── System-wide default frequencies (days) ───────────────────
+// Used only as a last resort — when a category has no row in
+// CategorySettings at all (shouldn't happen after the seed script,
+// but good to have as a safety net).
 const DEFAULT_FREQUENCIES = {
-  'Processor'         : 7,
-  'RAM'               : 3,
-  'SSD'               : 3,
-  'HDD'               : 3,
-  'Storage'           : 3,  // catch-all for SSD/HDD combined categories
-  'DEFAULT'           : 2,  // all other categories
+  'Processor' : 7,
+  'RAM'       : 3,
+  'SSD'       : 3,
+  'HDD'       : 3,
+  'Storage'   : 3,
+  'DEFAULT'   : 2,
 };
 
-/**
- * Returns the scrape frequency in days for a given category.
- * Uses override if set, otherwise falls back to DEFAULT_FREQUENCIES.
- */
-function getFrequencyDays(categoryName, scrapFreqOverride, isFreqOverridden) {
-  if (isFreqOverridden && scrapFreqOverride != null) {
-    return scrapFreqOverride;
-  }
-
-  // Case-insensitive match against defaults
+function getDefaultFrequency(categoryName) {
   const key = Object.keys(DEFAULT_FREQUENCIES).find(
     k => k.toLowerCase() === (categoryName || '').toLowerCase()
   );
-
   return DEFAULT_FREQUENCIES[key] || DEFAULT_FREQUENCIES['DEFAULT'];
 }
 
-/**
- * Returns true if this category is due for a scrape today.
- */
 function isDue(nextScrapDueAt) {
-  // Never scraped before → always due
   if (!nextScrapDueAt) return true;
-
-  const due  = new Date(nextScrapDueAt);
-  const now  = new Date();
-
-  return now >= due;
+  return new Date() >= new Date(nextScrapDueAt);
 }
 
 // ── SQL connection ────────────────────────────────────────────
@@ -102,58 +63,55 @@ async function getSqlPool() {
   });
 }
 
-// ── Load distinct categories from InternalProducts ────────────
-// Groups by Category and picks the frequency settings.
-// One row per unique category name.
+// ── Load category schedule ────────────────────────────────────
+// JOIN between InternalProducts (for timing state) and
+// CategorySettings (for frequency config).
+// LEFT JOIN so categories not yet in CategorySettings still appear
+// and get the hardcoded default frequency as fallback.
 async function loadCategorySchedule(pool) {
   const result = await pool.request().query(`
     SELECT
-      Category,
-      MAX(ScrapFreq_Override)  AS ScrapFreq_Override,
-      MAX(isFreqOverridden)    AS isFreqOverridden,
-      MAX(NextScrapDueAt)      AS NextScrapDueAt,
-      MAX(LastScrapedAt)       AS LastScrapedAt
-    FROM InternalProducts
-    WHERE Category IS NOT NULL
-    GROUP BY Category
-    ORDER BY Category
+      ip.Category,
+      MAX(ip.NextScrapDueAt)     AS NextScrapDueAt,
+      MAX(ip.LastScrapedAt)      AS LastScrapedAt,
+      -- Prefer CategorySettings values; fall back to NULL if no row
+      MAX(cs.ScrapFreqDays)      AS ScrapFreqDays,
+      MAX(cs.IsScrapEnabled)     AS IsScrapEnabled
+    FROM InternalProducts ip
+    LEFT JOIN CategorySettings cs ON cs.CategoryName = ip.Category
+    WHERE ip.Category IS NOT NULL
+    GROUP BY ip.Category
+    ORDER BY ip.Category
   `);
 
   return result.recordset;
 }
 
 // ── Update LastScrapedAt + NextScrapDueAt after successful scrape ──
-// ONLY called by the scheduler — never by manual refresh.
+// Still writes to InternalProducts — timing state stays there.
 async function updateScrapedTimestamps(pool, categoryName, frequencyDays) {
   const now     = new Date();
   const nextDue = new Date(now);
   nextDue.setDate(nextDue.getDate() + frequencyDays);
 
-  const nowStr     = now.toISOString();
-  const nextDueStr = nextDue.toISOString();
-
   await pool.request()
-    .input('Category',      sql.NVarChar(200), categoryName)
-    .input('LastScrapedAt', sql.NVarChar(50),  nowStr)
-    .input('NextScrapDueAt',sql.NVarChar(50),  nextDueStr)
+    .input('Category',       sql.NVarChar(200), categoryName)
+    .input('LastScrapedAt',  sql.NVarChar(50),  now.toISOString())
+    .input('NextScrapDueAt', sql.NVarChar(50),  nextDue.toISOString())
     .query(`
       UPDATE InternalProducts
-      SET
-        LastScrapedAt  = @LastScrapedAt,
-        NextScrapDueAt = @NextScrapDueAt
+      SET LastScrapedAt  = @LastScrapedAt,
+          NextScrapDueAt = @NextScrapDueAt
       WHERE Category = @Category
     `);
 
-  console.log(`   ⏰ NextScrapDueAt set to ${nextDueStr} (+${frequencyDays} days)`);
+  console.log(`   ⏰ NextScrapDueAt set to ${nextDue.toISOString()} (+${frequencyDays} days)`);
 }
 
 // ── Find matching store + category config from urls.js ────────
-// Maps a DB category name to a store parser config.
-// Returns { store, category } or null if not configured.
 function findStoreConfig(categoryName) {
   for (const store of STORES) {
     for (const cat of store.categories) {
-      // Match by slug (case-insensitive, hyphen-tolerant)
       const normalised = categoryName.toLowerCase().replace(/\s+/g, '-');
       if (
         cat.slug.toLowerCase() === normalised ||
@@ -192,20 +150,22 @@ async function runScheduler() {
     pool = await getSqlPool();
     console.log('🔌 Connected to SQL\n');
 
-    // Step 1: Load all categories + their schedule state
     const categories = await loadCategorySchedule(pool);
-    console.log(`📋 Found ${categories.length} distinct categories in InternalProducts\n`);
+    console.log(`📋 Found ${categories.length} distinct categories\n`);
 
     const due     = [];
     const skipped = [];
+    const paused  = [];
 
-    // Step 2: Decide which categories need scraping
     for (const row of categories) {
-      const freqDays = getFrequencyDays(
-        row.Category,
-        row.ScrapFreq_Override,
-        row.isFreqOverridden
-      );
+      // IsScrapEnabled = 0 means paused from the UI
+      if (row.IsScrapEnabled === false || row.IsScrapEnabled === 0) {
+        paused.push(row);
+        continue;
+      }
+
+      // Frequency: use CategorySettings value, fall back to hardcoded default
+      const freqDays = row.ScrapFreqDays ?? getDefaultFrequency(row.Category);
 
       if (isDue(row.NextScrapDueAt)) {
         due.push({ ...row, freqDays });
@@ -216,6 +176,10 @@ async function runScheduler() {
 
     console.log(`✅ Due for scraping   : ${due.length} categories`);
     console.log(`⏭️  Not due yet        : ${skipped.length} categories`);
+    if (paused.length > 0) {
+      console.log(`⏸️  Paused (UI)        : ${paused.length} categories`);
+      paused.forEach(r => console.log(`   → ${r.Category}`));
+    }
 
     if (skipped.length > 0) {
       console.log('\n   Skipped (next due):');
@@ -231,7 +195,6 @@ async function runScheduler() {
 
     console.log('\n🚀 Starting scrapes...');
 
-    // Step 3: Scrape each due category
     let totalScraped = 0;
     let totalFailed  = 0;
 
@@ -241,8 +204,7 @@ async function runScheduler() {
       const config = findStoreConfig(row.Category);
 
       if (!config) {
-        console.log(`   ⚠️  No store config found for category "${row.Category}" in urls.js — skipping`);
-        console.log(`   💡 Add this category to a store in src/urls.js to enable auto-scraping`);
+        console.log(`   ⚠️  No store config found for "${row.Category}" in urls.js — skipping`);
         continue;
       }
 
@@ -253,26 +215,20 @@ async function runScheduler() {
         totalScraped += result.saved;
         totalFailed  += result.failed;
 
-        // Step 4: Update timestamps — ONLY auto scheduler writes these
         await updateScrapedTimestamps(pool, row.Category, row.freqDays);
-
       } catch (err) {
         console.error(`   ❌ Scrape failed for ${row.Category}: ${err.message}`);
         totalFailed++;
       }
     }
 
-    // Step 5: Push all new Cosmos data to SQL
     console.log('\n📤 Running cleanup mapper (Cosmos → SQL)...');
     await runCleanupMapper();
 
     const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-
     console.log(`\n🎉 Scheduler done in ${totalSec}s`);
     console.log(`   Products scraped : ${totalScraped}`);
     console.log(`   Failed           : ${totalFailed}`);
-    console.log(`\n   Run recommendation engine next:`);
-    console.log(`   node src/recommendation_engine.js`);
 
   } catch (err) {
     console.error('\n❌ Scheduler fatal error:', err.message);
@@ -282,7 +238,6 @@ async function runScheduler() {
   }
 }
 
-// Run directly
 if (require.main === module) {
   runScheduler();
 }

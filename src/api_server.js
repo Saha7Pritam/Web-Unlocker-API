@@ -661,6 +661,143 @@ app.get('/api/bulk-upload-session/:sessionId/export', requireAuth, async (req, r
 });
 
 
+
+
+
+// ─────────────────────────────────────────────────────────────
+// ADD THESE TWO ROUTES TO src/api_server.js
+// Place them just before the app.listen() call at the bottom.
+// ─────────────────────────────────────────────────────────────
+
+
+// ── GET /api/category-settings ────────────────────────────────
+// Returns all rows from CategorySettings.
+// Frontend uses this to populate both tabs in the Settings panel.
+
+app.get('/api/category-settings', requireAuth, async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request().query(`
+      SELECT
+        CategoryName,
+        GST,
+        CostOfBusiness,
+        ProfitMargin,
+        ScrapFreqDays,
+        IsScrapEnabled,
+        UpdatedAt,
+        UpdatedBy
+      FROM CategorySettings
+      ORDER BY CategoryName
+    `);
+    console.log(`✅ /api/category-settings — ${result.recordset.length} rows`);
+    res.json({ success: true, data: result.recordset });
+  } catch (err) {
+    console.error('❌ /api/category-settings error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── PUT /api/category-settings/:category ─────────────────────
+// Updates one category row in CategorySettings.
+// Accepts any combination of: GST, CostOfBusiness, ProfitMargin,
+// ScrapFreqDays, IsScrapEnabled.
+// NULL values for business variables = revert to system default.
+//
+// Body example:
+//   { GST: 18, CostOfBusiness: 7, ProfitMargin: 5,
+//     ScrapFreqDays: 3, IsScrapEnabled: true }
+
+app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
+  const categoryName = decodeURIComponent(req.params.category);
+  const { GST, CostOfBusiness, ProfitMargin, ScrapFreqDays, IsScrapEnabled } = req.body;
+  const updatedBy = req.session?.user?.email || 'unknown';
+
+  // Validate numeric fields when provided
+  if (GST !== undefined && GST !== null) {
+    const v = parseFloat(GST);
+    if (isNaN(v) || v < 0 || v > 100) {
+      return res.status(400).json({ success: false, error: 'GST must be between 0 and 100' });
+    }
+  }
+  if (CostOfBusiness !== undefined && CostOfBusiness !== null) {
+    const v = parseFloat(CostOfBusiness);
+    if (isNaN(v) || v < 0 || v > 100) {
+      return res.status(400).json({ success: false, error: 'CostOfBusiness must be between 0 and 100' });
+    }
+  }
+  if (ProfitMargin !== undefined && ProfitMargin !== null) {
+    const v = parseFloat(ProfitMargin);
+    if (isNaN(v) || v < 0 || v > 100) {
+      return res.status(400).json({ success: false, error: 'ProfitMargin must be between 0 and 100' });
+    }
+  }
+  if (ScrapFreqDays !== undefined && ScrapFreqDays !== null) {
+    const v = parseInt(ScrapFreqDays);
+    if (isNaN(v) || v < 1 || v > 365) {
+      return res.status(400).json({ success: false, error: 'ScrapFreqDays must be between 1 and 365' });
+    }
+  }
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    // MERGE: update if exists, insert if category not yet in table
+    // (handles edge case where a new category appeared in InternalProducts
+    // after the initial seed script was run)
+    const result = await pool.request()
+      .input('CategoryName',    sql.NVarChar(200),  categoryName)
+      .input('GST',             sql.Decimal(5, 2),  GST            ?? null)
+      .input('CostOfBusiness',  sql.Decimal(5, 2),  CostOfBusiness ?? null)
+      .input('ProfitMargin',    sql.Decimal(5, 2),  ProfitMargin   ?? null)
+      .input('ScrapFreqDays',   sql.Int,             ScrapFreqDays  ?? 7)
+      .input('IsScrapEnabled',  sql.Bit,             IsScrapEnabled ?? 1)
+      .input('UpdatedBy',       sql.NVarChar(150),   updatedBy)
+      .query(`
+        MERGE CategorySettings AS target
+        USING (SELECT @CategoryName AS CategoryName) AS source
+          ON target.CategoryName = source.CategoryName
+
+        WHEN MATCHED THEN
+          UPDATE SET
+            GST            = @GST,
+            CostOfBusiness = @CostOfBusiness,
+            ProfitMargin   = @ProfitMargin,
+            ScrapFreqDays  = @ScrapFreqDays,
+            IsScrapEnabled = @IsScrapEnabled,
+            UpdatedAt      = GETDATE(),
+            UpdatedBy      = @UpdatedBy
+
+        WHEN NOT MATCHED THEN
+          INSERT (CategoryName, GST, CostOfBusiness, ProfitMargin,
+                  ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy)
+          VALUES (@CategoryName, @GST, @CostOfBusiness, @ProfitMargin,
+                  @ScrapFreqDays, @IsScrapEnabled, GETDATE(), @UpdatedBy);
+
+        SELECT CategoryName, GST, CostOfBusiness, ProfitMargin,
+               ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy
+        FROM CategorySettings
+        WHERE CategoryName = @CategoryName;
+      `);
+
+    console.log(`✅ /api/category-settings/${categoryName} — updated by ${updatedBy}`);
+    res.json({ success: true, data: result.recordset[0] });
+
+  } catch (err) {
+    console.error(`❌ /api/category-settings/${categoryName} error:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
 // ── GET /api/health ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
