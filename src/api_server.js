@@ -15,6 +15,7 @@ const { STORES }           = require('./urls');
 const session        = require('express-session');
 const { msalClient } = require('./auth/msalConfig');
 const { requireAuth } = require('./auth/authMiddleware');
+const { requireRole } = require('./auth/authMiddleware')
 
 const app  = express();
 const PORT = process.env.PORT || 8000;
@@ -43,7 +44,10 @@ app.get('/auth/login', async (req, res) => {
   res.redirect(authUrl);
 });
 
-// ── GET /callback ─────────────────────────────────────────────
+
+
+
+
 app.get('/callback', async (req, res) => {
   const tokenRequest = {
     code       : req.query.code,
@@ -52,10 +56,26 @@ app.get('/callback', async (req, res) => {
   };
   try {
     const response = await msalClient.acquireTokenByCode(tokenRequest);
+    const email = response.account.username.toLowerCase();
+
+    // Look up role in custom table
+    const pool = await getSqlPool();
+    const roleResult = await pool.request()
+      .input('Email', sql.NVarChar(255), email)
+      .query(`SELECT Role FROM UserRoles WHERE Email = @Email`);
+    await pool.close();
+
+    if (!roleResult.recordset.length) {
+      return res.status(403).send(`
+        <h2>Access denied</h2>
+        <p>${email} is not in the system. Ask an admin to add your account.</p>
+      `);
+    }
+
     req.session.user = {
       name : response.account.name,
-      email: response.account.username,
-      role : 'sales',
+      email: email,
+      role : roleResult.recordset[0].Role,   // 'admin' | 'supervisor' | 'sales'
     };
     res.redirect(process.env.FRONTEND_URL || 'http://localhost:5173');
   } catch (err) {
@@ -64,19 +84,64 @@ app.get('/callback', async (req, res) => {
   }
 });
 
+
+
+
+
+
 // ── GET /auth/me ──────────────────────────────────────────────
-app.get('/auth/me', (req, res) => {
+app.get('/auth/me', async (req, res) => {
   if (!req.session?.user) {
     return res.status(401).json({ authenticated: false });
   }
-  res.json({ authenticated: true, user: req.session.user });
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('Email', sql.NVarChar(255), req.session.user.email)
+      .query(`SELECT Role FROM UserRoles WHERE Email = @Email`);
+
+    if (!result.recordset.length) {
+      // User was removed from the table while session was active
+      req.session.destroy();
+      return res.status(401).json({ authenticated: false });
+    }
+
+    const freshRole = result.recordset[0].Role;
+
+    // Keep session in sync so middleware also sees the latest role
+    req.session.user.role = freshRole;
+
+    res.json({
+      authenticated: true,
+      user: {
+        name : req.session.user.name,
+        email: req.session.user.email,
+        role : freshRole,
+      },
+    });
+  } catch (err) {
+    // DB unreachable — fall back to cached session role rather than logging user out
+    console.error('❌ /auth/me role refresh failed:', err.message);
+    res.json({
+      authenticated: true,
+      user: req.session.user,
+    });
+  } finally {
+    if (pool) await pool.close();
+  }
 });
+
+
 
 // ── POST /auth/logout ─────────────────────────────────────────
 app.post('/auth/logout', (req, res) => {
   req.session.destroy();
   res.json({ success: true });
 });
+
+
 
 // ── SQL connection ────────────────────────────────────────────
 async function getSqlPool() {
@@ -790,6 +855,107 @@ app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
 
   } catch (err) {
     console.error(`❌ /api/category-settings/${categoryName} error:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+
+// ── GET /api/users ────────────────────────────────────────────
+// Returns all users in UserRoles table. Admin only.
+app.get('/api/users', requireRole('admin'), async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request().query(`
+      SELECT Email, Role, AddedBy, AddedAt, UpdatedBy, UpdatedAt
+      FROM UserRoles
+      ORDER BY AddedAt DESC
+    `);
+    res.json({ success: true, data: result.recordset });
+  } catch (err) {
+    console.error('❌ /api/users GET error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── POST /api/users ───────────────────────────────────────────
+// Add a new user or update an existing user's role. Admin only.
+app.post('/api/users', requireRole('admin'), async (req, res) => {
+  const { email, role } = req.body;
+  if (!email || !role) {
+    return res.status(400).json({ success: false, error: 'email and role are required' });
+  }
+  const normalizedEmail = email.trim().toLowerCase();
+  const validRoles = ['admin', 'supervisor', 'sales'];
+  if (!validRoles.includes(role)) {
+    return res.status(400).json({ success: false, error: `role must be one of: ${validRoles.join(', ')}` });
+  }
+
+  const addedBy = req.session.user.email;
+  let pool;
+  try {
+    pool = await getSqlPool();
+    // MERGE so re-adding an existing user just updates their role
+    await pool.request()
+      .input('Email',   sql.NVarChar(255), normalizedEmail)
+      .input('Role',    sql.NVarChar(50),  role)
+      .input('AddedBy', sql.NVarChar(255), addedBy)
+      .query(`
+        MERGE UserRoles AS target
+        USING (SELECT @Email AS Email) AS source
+          ON target.Email = source.Email
+        WHEN MATCHED THEN
+          UPDATE SET
+            Role      = @Role,
+            UpdatedBy = @AddedBy,
+            UpdatedAt = GETDATE()
+        WHEN NOT MATCHED THEN
+          INSERT (Email, Role, AddedBy)
+          VALUES (@Email, @Role, @AddedBy);
+      `);
+
+    console.log(`✅ /api/users — upserted: ${normalizedEmail} as ${role} by ${addedBy}`);
+    res.json({ success: true, data: { email: normalizedEmail, role } });
+  } catch (err) {
+    console.error('❌ /api/users POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── DELETE /api/users/:email ──────────────────────────────────
+// Remove a user. Admin only. Admins cannot delete themselves.
+app.delete('/api/users/:email', requireRole('admin'), async (req, res) => {
+  const targetEmail = decodeURIComponent(req.params.email).toLowerCase();
+  const selfEmail   = req.session.user.email;
+
+  if (targetEmail === selfEmail) {
+    return res.status(400).json({ success: false, error: 'You cannot remove yourself' });
+  }
+
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await pool.request()
+      .input('Email', sql.NVarChar(255), targetEmail)
+      .query(`DELETE FROM UserRoles WHERE Email = @Email`);
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    console.log(`✅ /api/users DELETE — removed: ${targetEmail} by ${selfEmail}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`❌ /api/users DELETE error:`, err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     if (pool) await pool.close();
