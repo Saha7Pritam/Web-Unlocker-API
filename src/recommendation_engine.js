@@ -302,4 +302,22 @@ async function run() {
   }
 }
 
-run();
+
+
+
+
+// Only auto-run when called directly via `npm run recommend`
+if (require.main === module) {
+  run();
+}
+
+// Export individual functions so api_server.js can call them on demand
+module.exports = {
+  getSqlPool,
+  loadCategorySettings,
+  loadInternalProducts,
+  loadCompetitorPrices,
+  buildCompetitorMap,
+  generateRecommendations,
+  updateRecommendedSP,
+};
